@@ -175,3 +175,7 @@ tmp/
 *.pem
 *.key
 *.gpg
+
+# NullShift specific
+nullshift.log
+*.nullshift
