@@ -1,37 +1,44 @@
+"""
+PatchedClient
+=============
+Lightweight telemetry/no-op client used by the CLI runner.
+When no ``patched_api_key`` is provided all methods are no-ops so NullShift
+continues to work fully offline.
+"""
 from __future__ import annotations
 
 import contextlib
-from typing_extensions import Any, Dict, Optional
+from typing import Any, Optional
 
 
 class PatchedClient:
-    """
-    Client for the patched.codes managed service.
-    Handles telemetry and API key management.
-    """
+    """Minimal telemetry client.  All methods are safe no-ops when key is absent."""
 
     def __init__(self, api_key: Optional[str] = None):
-        self.api_key = api_key
+        self._api_key = api_key
+        self._enabled = bool(api_key)
 
-    def send_public_telemetry(self, patchflow_name: str, inputs: Dict[str, Any]) -> None:
-        """Send anonymous telemetry about patchflow usage."""
-        # Telemetry is best-effort; never raise on failure
+    def send_public_telemetry(self, patchflow_name: str, inputs: dict) -> None:
+        if not self._enabled:
+            return
+        # Fire-and-forget; swallow any network error
         try:
             import requests
 
-            safe_inputs = {k: v for k, v in inputs.items() if "api_key" not in k.lower()}
             requests.post(
-                "https://app.patched.codes/api/v1/telemetry",
-                json={"patchflow": patchflow_name, "inputs": safe_inputs},
-                timeout=2,
+                "https://api.patched.codes/v1/telemetry",
+                json={"patchflow": patchflow_name, "inputs_keys": list(inputs.keys())},
+                headers={"Authorization": f"Bearer {self._api_key}"},
+                timeout=3,
             )
-        except Exception:
+        except Exception:  # noqa: BLE001
             pass
 
     @contextlib.contextmanager
-    def patched_telemetry(self, patchflow_name: str, output_dict: Dict[str, Any]):
-        """Context manager that captures patchflow output for telemetry."""
+    def patched_telemetry(self, patchflow_name: str, output_dict: dict):
+        """Context manager that yields output_dict; sends telemetry on exit."""
         try:
             yield output_dict
         finally:
-            pass
+            if self._enabled:
+                self.send_public_telemetry(patchflow_name, output_dict)

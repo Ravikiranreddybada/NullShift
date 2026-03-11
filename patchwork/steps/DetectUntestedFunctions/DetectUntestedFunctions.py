@@ -1,105 +1,109 @@
 """
 DetectUntestedFunctions
 =======================
-Parses a unified diff (from a pull-request) and identifies Python functions /
-methods that were **added or modified** but have no corresponding test coverage
-in the repository.
+Parses a unified git diff and identifies Python functions that were added or
+modified but have **no corresponding test coverage** in the repository.
 
-Detection strategy
-------------------
-1. Parse the diff to find new/changed Python function definitions using the
-   ``ast`` module (no external tree-sitter dependency required at runtime).
-2. Walk the repository's test files and build a set of called names.
-3. Return every function whose name does not appear in any test file.
+Inputs
+------
+pr_diff : str
+    Unified diff produced by ``git diff origin/main``.
+repo_path : str, optional
+    Absolute (or relative) path to the local repository root.  Defaults to
+    the current working directory (``"."``).
+test_directories : str, optional
+    Comma-separated list of folder names that are considered test roots.
+    Defaults to ``"tests,test"``.
 
-Inputs (TypedDict)
-------------------
-- ``repo_path``        : str  – local path to the git repository root.
-- ``pr_diff``          : str  – unified diff text (output of ``git diff``).
-- ``test_directories`` : list[str] (optional) – subdirectory names considered
-                         test folders.  Defaults to ``["tests", "test"]``.
-
-Outputs (TypedDict)
--------------------
-- ``untested_functions``: list[dict] – each entry has keys:
-    - ``name``        : function/method name
-    - ``file``        : source file (repo-relative)
-    - ``lineno``      : line number in source file
-    - ``source``      : full source text of the function
-    - ``class_name``  : enclosing class name or None
+Outputs
+-------
+untested_functions : list[dict]
+    Each entry has keys: ``name``, ``file``, ``lineno``, ``source``,
+    ``class_name`` (may be ``None``).
 """
 from __future__ import annotations
 
 import ast
-import os
 import re
+import textwrap
 from pathlib import Path
-from typing import Dict, List, Optional, Set
+from typing import List, Optional
 
 from typing_extensions import TypedDict
 
+from patchwork.logger import logger
 from patchwork.step import Step
 
 
 # ---------------------------------------------------------------------------
-# TypedDicts
+# TypedDict contracts
 # ---------------------------------------------------------------------------
 
-class DetectUntestedFunctionsInputs(TypedDict, total=False):
-    repo_path: str
+class _Inputs(TypedDict, total=False):
+    pr_diff: str           # required
+    repo_path: str         # optional
+    test_directories: str  # optional
+
+
+class _Inputs_Required(TypedDict):
     pr_diff: str
-    test_directories: List[str]
 
 
-class DetectUntestedFunctionsOutputs(TypedDict):
-    untested_functions: List[Dict]
+class Inputs(_Inputs_Required, _Inputs):
+    pass
+
+
+class Outputs(TypedDict):
+    untested_functions: List[dict]
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
-_DIFF_FILE_RE = re.compile(r"^\+\+\+ b/(.+\.py)$", re.MULTILINE)
-_DIFF_FUNC_RE = re.compile(r"^\+\s*def\s+(\w+)\s*\(", re.MULTILINE)
+_DIFF_FILE_HEADER = re.compile(r"^\+\+\+ b/(.+)$", re.MULTILINE)
+_DIFF_ADDED_LINE = re.compile(r"^\+(?!\+\+)", re.MULTILINE)
 
 
-def _extract_changed_files(diff: str) -> List[str]:
-    """Return list of Python file paths touched by the diff."""
-    return _DIFF_FILE_RE.findall(diff)
+def _parse_added_files(diff: str) -> dict[str, str]:
+    """Return {relative_path: added_lines_as_source} for every .py file in the diff."""
+    result: dict[str, str] = {}
+    # Split diff into per-file sections
+    sections = re.split(r"^diff --git ", diff, flags=re.MULTILINE)
+    for section in sections:
+        # Find the +++ b/... header
+        match = _DIFF_FILE_HEADER.search(section)
+        if not match:
+            continue
+        file_path = match.group(1)
+        if not file_path.endswith(".py"):
+            continue
+        # Collect added lines (strip the leading '+')
+        added_lines = [line[1:] for line in section.splitlines() if re.match(r"^\+(?!\+\+)", line)]
+        if added_lines:
+            result[file_path] = "\n".join(added_lines)
+    return result
 
 
-def _collect_function_names_from_diff(diff: str) -> Set[str]:
-    """
-    Collect function names that appear as **added** lines in the diff
-    (lines beginning with '+').
-    """
-    return set(_DIFF_FUNC_RE.findall(diff))
-
-
-def _get_function_source(source: str, node: ast.FunctionDef) -> str:
-    """Extract source lines for a function node."""
-    lines = source.splitlines()
-    # ast gives 1-based line numbers
-    func_lines = lines[node.lineno - 1 : node.end_lineno]
-    return "\n".join(func_lines)
-
-
-def _parse_functions_from_file(filepath: Path) -> List[Dict]:
-    """
-    Return a list of dicts describing every top-level and method function
-    defined in *filepath*.
-    """
-    try:
-        source = filepath.read_text(encoding="utf-8", errors="replace")
-        tree = ast.parse(source, filename=str(filepath))
-    except SyntaxError:
-        return []
-
+def _extract_functions(source: str, file_path: str) -> list[dict]:
+    """Parse *source* and return a list of function-info dicts."""
     functions = []
+    try:
+        tree = ast.parse(textwrap.dedent(source))
+    except SyntaxError:
+        logger.warning(f"Could not parse Python source from diff for {file_path}")
+        return functions
 
     for node in ast.walk(tree):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            # Determine enclosing class (if any)
+            # Reconstruct source lines
+            try:
+                func_lines = source.splitlines()[node.lineno - 1: node.end_lineno]
+                func_source = "\n".join(func_lines)
+            except (AttributeError, IndexError):
+                func_source = f"def {node.name}(...): ..."
+
+            # Try to find enclosing class
             class_name: Optional[str] = None
             for parent in ast.walk(tree):
                 if isinstance(parent, ast.ClassDef):
@@ -111,46 +115,35 @@ def _parse_functions_from_file(filepath: Path) -> List[Dict]:
             functions.append(
                 {
                     "name": node.name,
-                    "file": str(filepath),
+                    "file": file_path,
                     "lineno": node.lineno,
-                    "source": _get_function_source(source, node),
+                    "source": func_source,
                     "class_name": class_name,
                 }
             )
-
     return functions
 
 
-def _collect_tested_names(repo_root: Path, test_dirs: List[str]) -> Set[str]:
-    """
-    Walk test directories and collect all function/method *names* that are
-    referenced (called, imported, or defined) – used as a coarse proxy for
-    coverage.
-    """
-    tested: Set[str] = set()
+def _is_test_function(name: str) -> bool:
+    return name.startswith("test_") or name.startswith("Test")
 
+
+def _find_tested_names(repo_path: Path, test_dirs: list[str]) -> set[str]:
+    """Collect all function names that appear in existing test files."""
+    tested: set[str] = set()
     for test_dir_name in test_dirs:
-        test_dir = repo_root / test_dir_name
+        test_dir = repo_path / test_dir_name
         if not test_dir.is_dir():
             continue
-        for py_file in test_dir.rglob("*.py"):
+        for test_file in test_dir.rglob("test_*.py"):
             try:
-                source = py_file.read_text(encoding="utf-8", errors="replace")
-                tree = ast.parse(source)
-            except SyntaxError:
-                continue
-
-            for node in ast.walk(tree):
-                # Names referenced in tests
-                if isinstance(node, ast.Name):
-                    tested.add(node.id)
-                # Attribute calls like ``obj.my_func()``
-                elif isinstance(node, ast.Attribute):
-                    tested.add(node.attr)
-                # Function definitions inside test files (test_* helpers)
-                elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                    tested.add(node.name)
-
+                content = test_file.read_text(encoding="utf-8", errors="replace")
+                tested.update(re.findall(r"\btest_(\w+)\b", content))
+                # Also gather all identifiers that appear in import statements
+                for m in re.finditer(r"(?:from|import)\s+\S+\s+import\s+(\w+)", content):
+                    tested.add(m.group(1))
+            except OSError:
+                pass
     return tested
 
 
@@ -158,56 +151,38 @@ def _collect_tested_names(repo_root: Path, test_dirs: List[str]) -> Set[str]:
 # Step
 # ---------------------------------------------------------------------------
 
-class DetectUntestedFunctions(
-    Step,
-    input_class=DetectUntestedFunctionsInputs,
-    output_class=DetectUntestedFunctionsOutputs,
-):
-    """
-    Analyses a PR diff to surface Python functions that lack unit tests.
-    """
+class DetectUntestedFunctions(Step, input_class=Inputs, output_class=Outputs):
+    """Detect Python functions added/modified in a PR diff that lack test coverage."""
 
-    def __init__(self, inputs: Dict):
+    def __init__(self, inputs: dict):
         super().__init__(inputs)
-        self.repo_path = Path(inputs.get("repo_path", "."))
-        self.pr_diff: str = inputs["pr_diff"]
-        self.test_directories: List[str] = inputs.get(
-            "test_directories", ["tests", "test"]
-        )
+        self._diff: str = inputs["pr_diff"]
+        self._repo_path = Path(inputs.get("repo_path", ".")).resolve()
+        raw_dirs = inputs.get("test_directories", "tests,test")
+        self._test_dirs = [d.strip() for d in raw_dirs.split(",") if d.strip()]
 
-    def run(self) -> Dict:
-        changed_func_names = _collect_function_names_from_diff(self.pr_diff)
-        changed_files = _extract_changed_files(self.pr_diff)
+    def run(self) -> dict:
+        logger.info("DetectUntestedFunctions: parsing diff …")
 
-        if not changed_func_names:
-            from patchwork.step import StepStatus
-            self.set_status(StepStatus.SKIPPED, "No Python functions added or modified in diff.")
+        added_by_file = _parse_added_files(self._diff)
+        if not added_by_file:
+            logger.info("No added Python files found in diff.")
             return {"untested_functions": []}
 
-        tested_names = _collect_tested_names(self.repo_path, self.test_directories)
+        tested_names = _find_tested_names(self._repo_path, self._test_dirs)
+        logger.info(f"Found {len(tested_names)} already-tested symbol(s) in test directories.")
 
-        untested: List[Dict] = []
+        untested: list[dict] = []
+        for file_path, added_source in added_by_file.items():
+            functions = _extract_functions(added_source, file_path)
+            for fn in functions:
+                if _is_test_function(fn["name"]):
+                    continue  # skip functions that are themselves tests
+                if fn["name"] in tested_names:
+                    logger.info(f"  ✓ {fn['name']} already covered — skipping.")
+                    continue
+                logger.info(f"  ✗ {fn['name']} in {file_path} — no test found.")
+                untested.append(fn)
 
-        for rel_path in changed_files:
-            abs_path = self.repo_path / rel_path
-            if not abs_path.is_file():
-                continue
-            for func_info in _parse_functions_from_file(abs_path):
-                if func_info["name"] in changed_func_names:
-                    if func_info["name"] not in tested_names:
-                        # Make path relative for cleaner output
-                        try:
-                            func_info["file"] = str(
-                                Path(func_info["file"]).relative_to(self.repo_path)
-                            )
-                        except ValueError:
-                            pass
-                        untested.append(func_info)
-
-        from patchwork.logger import logger
-        logger.info(
-            f"DetectUntestedFunctions: found {len(untested)} untested function(s) "
-            f"out of {len(changed_func_names)} changed."
-        )
-
+        logger.info(f"DetectUntestedFunctions: {len(untested)} untested function(s) found.")
         return {"untested_functions": untested}

@@ -1,58 +1,67 @@
 """
 CreateTestPR
 ============
-Writes the generated test files to the repository, commits them on a new
-branch, and opens a pull request on GitHub.
+Writes generated test files to disk and (unless ``dry_run`` is set) commits
+them on a new git branch and opens a GitHub pull request.
 
-Inputs (TypedDict)
-------------------
-- ``generated_tests``   : list[dict] – from GenerateUnitTests
-- ``repo_path``         : str        – local path to the git repository root
-- ``github_api_key``    : str        – GitHub personal access token
-- ``pr_branch_prefix``  : str        – branch prefix (default: "nullshift/auto-tests")
-- ``pr_title``          : str        – PR title (default: auto-generated)
-- ``pr_body``           : str        – PR body  (default: auto-generated)
-- ``base_branch``       : str        – target branch (default: "main")
-- ``dry_run``           : bool       – if True, write files but skip git/PR (default: False)
+Inputs
+------
+generated_tests : list[dict]
+    Output from GenerateUnitTests.
+repo_path : str, optional
+    Local repo root.  Defaults to ``"."``.
+github_api_key : str, optional
+    GitHub personal access token.  Required unless ``dry_run=True``.
+base_branch : str, optional
+    PR target branch.  Defaults to ``"main"``.
+pr_branch_prefix : str, optional
+    New branch name prefix.  Defaults to ``"nullshift/auto-tests"``.
+dry_run : bool, optional
+    When ``True`` write files locally but skip git and GitHub operations.
 
-Outputs (TypedDict)
--------------------
-- ``pr_url``            : str  – URL of the created PR (empty string on dry_run)
-- ``test_files_written``: list[str] – repo-relative paths of files written
-- ``branch_name``       : str  – name of the created branch
+Outputs
+-------
+pr_url : str
+    URL of the created PR, or ``"dry_run"`` when skipping GitHub.
+written_files : list[str]
+    Paths of test files written to disk.
 """
 from __future__ import annotations
 
-import os
 import textwrap
-from datetime import datetime
+import uuid
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import List
 
 from typing_extensions import TypedDict
 
-from patchwork.step import Step, StepStatus
+from patchwork.logger import logger
+from patchwork.step import Step
 
 # ---------------------------------------------------------------------------
 # TypedDicts
 # ---------------------------------------------------------------------------
 
 
-class CreateTestPRInputs(TypedDict, total=False):
-    generated_tests: List[Dict]
+class _Inputs(TypedDict, total=False):
     repo_path: str
     github_api_key: str
-    pr_branch_prefix: str
-    pr_title: str
-    pr_body: str
     base_branch: str
+    pr_branch_prefix: str
     dry_run: bool
 
 
-class CreateTestPROutputs(TypedDict):
+class _Required(TypedDict):
+    generated_tests: List[dict]
+
+
+class Inputs(_Required, _Inputs):
+    pass
+
+
+class Outputs(TypedDict):
     pr_url: str
-    test_files_written: List[str]
-    branch_name: str
+    written_files: List[str]
 
 
 # ---------------------------------------------------------------------------
@@ -60,43 +69,85 @@ class CreateTestPROutputs(TypedDict):
 # ---------------------------------------------------------------------------
 
 
-def _build_pr_body(generated_tests: List[Dict]) -> str:
-    lines = [
-        "## 🤖 Auto-generated Unit Tests by NullShift",
-        "",
-        "This PR was created automatically by [NullShift](https://github.com/Ravikiranreddybada/NullShift).",
-        "It adds pytest unit tests for functions that were modified in the triggering PR but lacked test coverage.",
-        "",
-        "### Functions covered",
-        "",
-    ]
+def _write_test_files(generated_tests: list[dict], repo_path: Path) -> dict[str, str]:
+    """Write test source to disk.  Returns {test_file: source} map (deduped by file)."""
+    file_map: dict[str, str] = {}
     for entry in generated_tests:
-        class_prefix = f"{entry['class_name']}." if entry.get("class_name") else ""
-        lines.append(f"- `{class_prefix}{entry['function_name']}` in `{entry['source_file']}`")
-    lines += [
-        "",
-        "> **Review these tests carefully** before merging — LLM-generated tests may",
-        "> need adjustment to match your domain logic.",
-    ]
-    return "\n".join(lines)
+        test_path = entry["test_file"]
+        # Merge multiple functions into the same file (last write wins if already combined by GenerateUnitTests)
+        if test_path not in file_map:
+            file_map[test_path] = entry["test_source"]
+
+    written: dict[str, str] = {}
+    for rel_path, source in file_map.items():
+        abs_path = repo_path / rel_path
+        abs_path.parent.mkdir(parents=True, exist_ok=True)
+        abs_path.write_text(source, encoding="utf-8")
+        written[rel_path] = source
+        logger.info(f"  Written: {abs_path}")
+    return written
 
 
-def _merge_test_files(generated_tests: List[Dict]) -> Dict[str, str]:
-    """
-    Merge multiple generated tests that target the same test file into a single
-    source blob (de-duplicating identical import lines).
-    """
-    merged: Dict[str, List[str]] = {}
-    for entry in generated_tests:
-        test_file = entry["test_file"]
-        merged.setdefault(test_file, []).append(entry["test_source"])
+def _git_commit_and_push(repo_path: Path, branch: str, files: list[str], base_branch: str) -> None:
+    """Create branch, stage files, commit, and push."""
+    import git  # gitpython
 
-    result: Dict[str, str] = {}
-    for test_file, sources in merged.items():
-        # Simple concat with a separator comment
-        combined = "\n\n# " + "-" * 60 + "\n\n".join(sources)
-        result[test_file] = combined
-    return result
+    repo = git.Repo(repo_path)
+    # Create and checkout new branch from current HEAD
+    new_branch = repo.create_head(branch)
+    new_branch.checkout()
+
+    repo.index.add([str(repo_path / f) for f in files])
+    repo.index.commit(
+        textwrap.dedent(
+            f"""\
+            chore(nullshift): auto-generate unit tests
+
+            Generated by NullShift for {len(files)} test file(s).
+            Target branch: {base_branch}
+            """
+        )
+    )
+    origin = repo.remote("origin")
+    origin.push(refspec=f"{branch}:{branch}")
+    logger.info(f"Pushed branch '{branch}' to origin.")
+
+
+def _open_github_pr(repo_path: Path, github_api_key: str, branch: str, base_branch: str, file_count: int) -> str:
+    """Open a GitHub PR and return its HTML URL."""
+    from github import Github  # PyGithub
+    import git
+
+    repo = git.Repo(repo_path)
+    remote_url = repo.remote("origin").url  # e.g. git@github.com:org/repo.git
+
+    # Parse org/repo from various URL formats
+    import re
+    match = re.search(r"[:/]([^/:]+/[^/]+?)(?:\.git)?$", remote_url)
+    if not match:
+        raise ValueError(f"Cannot parse GitHub org/repo from remote URL: {remote_url}")
+    full_repo_name = match.group(1)
+
+    gh = Github(github_api_key)
+    gh_repo = gh.get_repo(full_repo_name)
+    pr = gh_repo.create_pull(
+        title=f"[NullShift] Auto-generated unit tests ({file_count} file(s))",
+        body=textwrap.dedent(
+            """\
+            ## 🤖 NullShift — Auto-generated Tests
+
+            This PR was created automatically by **NullShift**.  
+            It adds pytest unit tests for functions detected on the PR diff that
+            had no existing coverage.
+
+            > Please review, adjust, and merge when satisfied.
+            """
+        ),
+        head=branch,
+        base=base_branch,
+    )
+    logger.info(f"GitHub PR created: {pr.html_url}")
+    return pr.html_url
 
 
 # ---------------------------------------------------------------------------
@@ -104,130 +155,43 @@ def _merge_test_files(generated_tests: List[Dict]) -> Dict[str, str]:
 # ---------------------------------------------------------------------------
 
 
-class CreateTestPR(
-    Step,
-    input_class=CreateTestPRInputs,
-    output_class=CreateTestPROutputs,
-):
-    """
-    Commits generated test files and opens a GitHub pull-request.
-    """
+class CreateTestPR(Step, input_class=Inputs, output_class=Outputs):
+    """Write generated tests to disk and optionally open a GitHub PR."""
 
-    def __init__(self, inputs: Dict):
+    def __init__(self, inputs: dict):
         super().__init__(inputs)
-        self.generated_tests: List[Dict] = inputs.get("generated_tests", [])
-        self.repo_path = Path(inputs.get("repo_path", "."))
-        self.github_api_key: Optional[str] = inputs.get("github_api_key")
-        self.branch_prefix: str = inputs.get("pr_branch_prefix", "nullshift/auto-tests")
-        self.pr_title: Optional[str] = inputs.get("pr_title")
-        self.pr_body: Optional[str] = inputs.get("pr_body")
-        self.base_branch: str = inputs.get("base_branch", "main")
-        self.dry_run: bool = bool(inputs.get("dry_run", False))
+        self._tests: list[dict] = inputs["generated_tests"]
+        self._repo_path = Path(inputs.get("repo_path", ".")).resolve()
+        self._github_api_key: str = inputs.get("github_api_key", "")
+        self._base_branch: str = inputs.get("base_branch", "main")
+        self._branch_prefix: str = inputs.get("pr_branch_prefix", "nullshift/auto-tests")
+        self._dry_run: bool = bool(inputs.get("dry_run", False))
 
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
+    def run(self) -> dict:
+        if not self._tests:
+            logger.info("CreateTestPR: nothing to commit.")
+            return {"pr_url": "", "written_files": []}
 
-    def _write_test_files(self, merged: Dict[str, str]) -> List[str]:
-        written: List[str] = []
-        for rel_path, source in merged.items():
-            abs_path = self.repo_path / rel_path
-            abs_path.parent.mkdir(parents=True, exist_ok=True)
+        written = _write_test_files(self._tests, self._repo_path)
+        written_files = list(written.keys())
 
-            # Append to existing test file or create new one
-            if abs_path.exists():
-                existing = abs_path.read_text(encoding="utf-8")
-                source = existing.rstrip() + "\n\n" + source
+        if self._dry_run:
+            logger.info(f"CreateTestPR: dry_run=True — skipping git & GitHub. {len(written_files)} file(s) written.")
+            return {"pr_url": "dry_run", "written_files": written_files}
 
-            abs_path.write_text(source, encoding="utf-8")
-            written.append(rel_path)
-        return written
+        if not self._github_api_key:
+            raise ValueError("github_api_key is required unless dry_run=True")
 
-    def _git_commit_and_push(self, branch_name: str, files: List[str]) -> None:
-        import git
+        branch = f"{self._branch_prefix}-{uuid.uuid4().hex[:8]}"
+        logger.info(f"CreateTestPR: committing to branch '{branch}' …")
 
-        repo = git.Repo(self.repo_path)
-        # Create and checkout new branch
-        new_branch = repo.create_head(branch_name)
-        new_branch.checkout()
-
-        for rel_path in files:
-            repo.index.add([str(self.repo_path / rel_path)])
-
-        repo.index.commit(
-            f"test: add auto-generated unit tests via NullShift\n\n"
-            f"Generated for {len(files)} file(s): {', '.join(files)}"
+        _git_commit_and_push(self._repo_path, branch, written_files, self._base_branch)
+        pr_url = _open_github_pr(
+            self._repo_path,
+            self._github_api_key,
+            branch,
+            self._base_branch,
+            len(written_files),
         )
-        origin = repo.remote(name="origin")
-        origin.push(refspec=f"{branch_name}:{branch_name}")
 
-    def _create_github_pr(self, branch_name: str, title: str, body: str) -> str:
-        from github import Github
-
-        g = Github(self.github_api_key)
-        # Determine repo from git remote URL
-        import git
-
-        repo_obj = git.Repo(self.repo_path)
-        remote_url: str = repo_obj.remotes.origin.url
-        # Strip .git suffix and extract owner/repo
-        remote_url = remote_url.rstrip("/").removesuffix(".git")
-        repo_name = "/".join(remote_url.split("/")[-2:])
-
-        gh_repo = g.get_repo(repo_name)
-        pr = gh_repo.create_pull(
-            title=title,
-            body=body,
-            head=branch_name,
-            base=self.base_branch,
-        )
-        return pr.html_url
-
-    # ------------------------------------------------------------------
-    # run
-    # ------------------------------------------------------------------
-
-    def run(self) -> Dict:
-        from patchwork.logger import logger
-
-        if not self.generated_tests:
-            self.set_status(StepStatus.SKIPPED, "No generated tests to commit.")
-            return {"pr_url": "", "test_files_written": [], "branch_name": ""}
-
-        merged = _merge_test_files(self.generated_tests)
-        files_written = self._write_test_files(merged)
-        logger.info(f"CreateTestPR: wrote {len(files_written)} test file(s): {files_written}")
-
-        timestamp = datetime.utcnow().strftime("%Y%m%d%H%M%S")
-        branch_name = f"{self.branch_prefix}-{timestamp}"
-
-        pr_title = self.pr_title or (
-            f"test: auto-generated unit tests for "
-            f"{len(self.generated_tests)} function(s) [NullShift]"
-        )
-        pr_body = self.pr_body or _build_pr_body(self.generated_tests)
-
-        if self.dry_run:
-            logger.info(
-                f"CreateTestPR: dry_run=True — skipping git commit and PR creation.\n"
-                f"  Would create branch: {branch_name}\n"
-                f"  PR title: {pr_title}"
-            )
-            return {
-                "pr_url": "",
-                "test_files_written": files_written,
-                "branch_name": branch_name,
-            }
-
-        try:
-            self._git_commit_and_push(branch_name, files_written)
-            pr_url = self._create_github_pr(branch_name, pr_title, pr_body)
-            logger.info(f"CreateTestPR: PR created → {pr_url}")
-            return {
-                "pr_url": pr_url,
-                "test_files_written": files_written,
-                "branch_name": branch_name,
-            }
-        except Exception as exc:
-            self.set_status(StepStatus.FAILED, str(exc))
-            raise
+        return {"pr_url": pr_url, "written_files": written_files}

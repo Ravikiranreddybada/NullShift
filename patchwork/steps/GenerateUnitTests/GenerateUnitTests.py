@@ -1,112 +1,107 @@
 """
 GenerateUnitTests
 =================
-Takes the list of untested functions produced by ``DetectUntestedFunctions``
-and calls an LLM to generate ``pytest``-compatible unit tests for each one.
+For every untested function detected by ``DetectUntestedFunctions``, calls the
+Groq-compatible LLM and produces a pytest test file.
 
-The step renders a prompt for each function, calls the OpenAI-compatible
-endpoint, and returns the generated test source strings grouped by file.
+Inputs
+------
+untested_functions : list[dict]
+    Output from DetectUntestedFunctions.
+groq_api_key : str
+    Groq API key (``gsk_...``).  Can be any valid OpenAI-compatible key when
+    combined with a custom ``client_base_url``.
+model : str, optional
+    LLM model name.  Defaults to ``llama-3.3-70b-versatile``.
+client_base_url : str, optional
+    Base URL for the OpenAI-compatible endpoint.
+    Defaults to ``https://api.groq.com/openai/v1``.
 
-Inputs (TypedDict)
-------------------
-- ``untested_functions`` : list[dict]  – from DetectUntestedFunctions
-- ``openai_api_key``     : str         – OpenAI (or compatible) API key
-- ``model``              : str         – model name (default: gpt-4o-mini)
-- ``client_base_url``    : str         – optional custom endpoint
-- ``max_tokens``         : int         – max tokens per LLM call (default 2048)
-
-Outputs (TypedDict)
--------------------
-- ``generated_tests``    : list[dict]  – each entry:
-    - ``source_file``    : original source file (repo-relative)
-    - ``test_file``      : suggested test file path
-    - ``test_source``    : generated pytest source code
-    - ``function_name``  : name of the function under test
+Outputs
+-------
+generated_tests : list[dict]
+    Each entry has keys: ``source_file``, ``test_file``, ``test_source``,
+    ``function_name``, ``class_name``.
 """
 from __future__ import annotations
 
-import textwrap
-from pathlib import Path
-from typing import Dict, List, Optional
+import re
+from pathlib import Path, PurePosixPath
+from typing import List, Optional
 
+from openai import OpenAI
 from typing_extensions import TypedDict
 
-from patchwork.common.constants import DEFAULT_BASE_URL, DEFAULT_MAX_TOKENS, DEFAULT_MODEL
-from patchwork.step import Step, StepStatus
+from patchwork.logger import logger
+from patchwork.step import Step
 
 # ---------------------------------------------------------------------------
 # TypedDicts
 # ---------------------------------------------------------------------------
 
 
-class GenerateUnitTestsInputs(TypedDict, total=False):
-    untested_functions: List[Dict]
-    openai_api_key: str
+class _Inputs(TypedDict, total=False):
     model: str
     client_base_url: str
-    max_tokens: int
 
 
-class GenerateUnitTestsOutputs(TypedDict):
-    generated_tests: List[Dict]
+class _Required(TypedDict):
+    untested_functions: List[dict]
+    groq_api_key: str
+
+
+class Inputs(_Required, _Inputs):
+    pass
+
+
+class Outputs(TypedDict):
+    generated_tests: List[dict]
 
 
 # ---------------------------------------------------------------------------
-# Prompt template
+# Prompt
 # ---------------------------------------------------------------------------
 
-_SYSTEM_PROMPT = textwrap.dedent(
-    """\
-    You are an expert Python software engineer specialising in test-driven
-    development.  Your task is to write comprehensive ``pytest`` unit tests.
+_SYSTEM_PROMPT = """\
+You are an expert Python test engineer. Given a Python function, write a \
+comprehensive pytest test suite for it.
 
-    Rules:
-    - Use pytest fixtures and parametrize where appropriate.
-    - Mock external dependencies (network, filesystem, databases) with
-      ``unittest.mock`` or ``pytest-mock``.
-    - Cover: happy path, edge cases, and expected exceptions.
-    - Output ONLY valid Python source code – no markdown fences, no prose.
-    - Start with the required imports, then the test functions.
-    - Each test function name must start with ``test_``.
-    """
-)
+Rules:
+- Output ONLY valid Python code — no markdown fences, no explanations.
+- Start with necessary imports (e.g. ``import pytest`` and the module import).
+- Cover happy-path, edge cases, and error cases where applicable.
+- Use descriptive test function names prefixed with ``test_``.
+- Do NOT import from __future__ at the top-level unless strictly required.
+"""
 
-_USER_PROMPT_TEMPLATE = textwrap.dedent(
-    """\
-    Generate pytest unit tests for the following Python function.
+_USER_TEMPLATE = """\
+Generate pytest unit tests for the following Python function.
 
-    File: {file}
-    {class_context}
-    Function source:
-    ```python
-    {source}
-    ```
+File: {file_path}
+{class_context}
+Function source:
+```python
+{source}
+```
 
-    Write thorough tests.  Output only Python code.
-    """
-)
+Produce a complete, self-contained test file.
+"""
 
 
-def _build_user_prompt(func_info: Dict) -> str:
-    class_context = (
-        f"Class: {func_info['class_name']}" if func_info.get("class_name") else ""
-    )
-    return _USER_PROMPT_TEMPLATE.format(
-        file=func_info["file"],
-        class_context=class_context,
-        source=func_info["source"],
-    )
+def _derive_test_path(source_file: str) -> str:
+    """Convert e.g. ``patchwork/utils.py`` → ``tests/test_utils.py``."""
+    parts = PurePosixPath(source_file).parts
+    # Drop first directory if it looks like a package root
+    stem = PurePosixPath(source_file).stem
+    return f"tests/test_{stem}.py"
 
 
-def _suggest_test_file(source_file: str) -> str:
-    """Convert ``patchwork/steps/foo.py`` → ``tests/steps/test_foo.py``."""
-    p = Path(source_file)
-    parts = list(p.parts)
-    # strip leading src/package dir if present
-    test_name = f"test_{p.stem}.py"
-    if len(parts) > 1:
-        return str(Path("tests") / Path(*parts[1:-1]) / test_name)
-    return str(Path("tests") / test_name)
+def _strip_code_fences(text: str) -> str:
+    """Remove ```python … ``` or plain ``` … ``` wrapping if present."""
+    text = text.strip()
+    text = re.sub(r"^```(?:python)?\n?", "", text)
+    text = re.sub(r"\n?```$", "", text)
+    return text.strip()
 
 
 # ---------------------------------------------------------------------------
@@ -114,81 +109,75 @@ def _suggest_test_file(source_file: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-class GenerateUnitTests(
-    Step,
-    input_class=GenerateUnitTestsInputs,
-    output_class=GenerateUnitTestsOutputs,
-):
-    """
-    Calls an LLM to generate pytest unit tests for each untested function.
-    """
+class GenerateUnitTests(Step, input_class=Inputs, output_class=Outputs):
+    """Call an LLM to write pytest tests for each untested function."""
 
-    def __init__(self, inputs: Dict):
+    def __init__(self, inputs: dict):
         super().__init__(inputs)
-        self.untested_functions: List[Dict] = inputs.get("untested_functions", [])
-        self.api_key: Optional[str] = inputs.get("openai_api_key")
-        self.model: str = inputs.get("model", DEFAULT_MODEL)
-        self.base_url: Optional[str] = inputs.get("client_base_url", DEFAULT_BASE_URL)
-        self.max_tokens: int = int(inputs.get("max_tokens", DEFAULT_MAX_TOKENS))
-
-    def _call_llm(self, user_prompt: str) -> str:
-        """Call the OpenAI-compatible API and return the response text."""
-        from openai import OpenAI
-
-        kwargs: Dict = {"api_key": self.api_key or "no-key"}
-        if self.base_url:
-            kwargs["base_url"] = self.base_url
-
-        client = OpenAI(**kwargs)
-        response = client.chat.completions.create(
-            model=self.model,
-            messages=[
-                {"role": "system", "content": _SYSTEM_PROMPT},
-                {"role": "user", "content": user_prompt},
-            ],
-            max_tokens=self.max_tokens,
-            temperature=0.2,
+        self._functions: list[dict] = inputs["untested_functions"]
+        self._model: str = inputs.get("model", "llama-3.3-70b-versatile")
+        base_url: str = inputs.get("client_base_url", "https://api.groq.com/openai/v1")
+        self._client = OpenAI(
+            api_key=inputs["groq_api_key"],
+            base_url=base_url,
         )
-        return response.choices[0].message.content or ""
 
-    def run(self) -> Dict:
-        from patchwork.logger import logger
-
-        if not self.untested_functions:
-            self.set_status(StepStatus.SKIPPED, "No untested functions to generate tests for.")
+    def run(self) -> dict:
+        if not self._functions:
+            logger.info("GenerateUnitTests: no functions to process.")
             return {"generated_tests": []}
 
-        generated: List[Dict] = []
+        generated: list[dict] = []
+        # Group by (source_file, test_file) so we can merge multiple functions into one file
+        file_groups: dict[tuple[str, str], list[dict]] = {}
+        for fn in self._functions:
+            test_path = _derive_test_path(fn["file"])
+            key = (fn["file"], test_path)
+            file_groups.setdefault(key, []).append(fn)
 
-        for func_info in self.untested_functions:
-            func_name = func_info["name"]
-            logger.info(f"Generating tests for: {func_name} ({func_info['file']})")
+        for (source_file, test_file), functions in file_groups.items():
+            logger.info(f"GenerateUnitTests: generating tests for {source_file} ({len(functions)} function(s)) …")
+            combined_sources: list[str] = []
+            for fn in functions:
+                class_ctx = f"Class: {fn['class_name']}\n" if fn.get("class_name") else ""
+                combined_sources.append(
+                    _USER_TEMPLATE.format(
+                        file_path=source_file,
+                        class_context=class_ctx,
+                        source=fn["source"],
+                    )
+                )
+
+            prompt = "\n\n---\n\n".join(combined_sources)
+            if len(functions) > 1:
+                prompt += "\n\nGenerate a single unified test file covering ALL functions above."
 
             try:
-                prompt = _build_user_prompt(func_info)
-                test_source = self._call_llm(prompt)
+                response = self._client.chat.completions.create(
+                    model=self._model,
+                    messages=[
+                        {"role": "system", "content": _SYSTEM_PROMPT},
+                        {"role": "user", "content": prompt},
+                    ],
+                    temperature=0.2,
+                    max_tokens=2048,
+                )
+                raw = response.choices[0].message.content or ""
+                test_source = _strip_code_fences(raw)
+            except Exception as exc:  # noqa: BLE001
+                logger.error(f"  LLM call failed for {source_file}: {exc}")
+                continue
 
-                # Strip accidental markdown fences
-                if test_source.startswith("```"):
-                    lines = test_source.splitlines()
-                    test_source = "\n".join(
-                        l for l in lines if not l.startswith("```")
-                    )
-
+            for fn in functions:
                 generated.append(
                     {
-                        "source_file": func_info["file"],
-                        "test_file": _suggest_test_file(func_info["file"]),
-                        "test_source": test_source.strip(),
-                        "function_name": func_name,
-                        "class_name": func_info.get("class_name"),
+                        "source_file": source_file,
+                        "test_file": test_file,
+                        "test_source": test_source,
+                        "function_name": fn["name"],
+                        "class_name": fn.get("class_name"),
                     }
                 )
-                logger.info(f"  ✓ Tests generated for {func_name}")
 
-            except Exception as exc:
-                logger.warning(f"  ✗ Failed to generate tests for {func_name}: {exc}")
-                self.set_status(StepStatus.WARNING, str(exc))
-
-        logger.info(f"GenerateUnitTests: generated tests for {len(generated)} function(s).")
+        logger.info(f"GenerateUnitTests: produced {len(generated)} test record(s).")
         return {"generated_tests": generated}

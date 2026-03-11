@@ -1,61 +1,62 @@
 """
-NullShift Patchflow
+NullShift patchflow
 ===================
-End-to-end pipeline that:
-  1. Detects untested Python functions in a PR diff.
-  2. Generates pytest unit tests for each one via an LLM.
-  3. Commits the tests and opens a GitHub PR.
+Orchestrates three steps end-to-end:
 
-Quick start
------------
-Run against the current repo, providing a Groq key and a diff:
-
-    nullshift NullShift \\
-        openai_api_key=gsk_... \\
-        github_api_key=ghp_... \\
-        pr_diff="$(git diff origin/main)"
-
-To try without creating a real PR (local dry-run):
-
-    nullshift NullShift openai_api_key=gsk_... pr_diff="$(git diff)" dry_run
+1. DetectUntestedFunctions — find Python functions in the PR diff with no tests.
+2. GenerateUnitTests       — call Groq LLM to write pytest suites.
+3. CreateTestPR            — write files and open a GitHub pull request.
 """
 from __future__ import annotations
 
-from typing import Any, Dict
+from typing_extensions import Any
 
-from patchwork.steps.CreateTestPR.CreateTestPR import CreateTestPR
-from patchwork.steps.DetectUntestedFunctions.DetectUntestedFunctions import (
-    DetectUntestedFunctions,
-)
-from patchwork.steps.GenerateUnitTests.GenerateUnitTests import GenerateUnitTests
+from patchwork.logger import logger
+from patchwork.steps.CreateTestPR import CreateTestPR
+from patchwork.steps.DetectUntestedFunctions import DetectUntestedFunctions
+from patchwork.steps.GenerateUnitTests import GenerateUnitTests
 
 
 class NullShift:
-    """
-    AI-powered patchflow that detects untested functions on PRs and
-    autonomously generates unit tests.
-    """
+    """Top-level patchflow: detect → generate → PR."""
 
-    def __init__(self, inputs: Dict[str, Any]):
+    def __init__(self, inputs: dict[str, Any]):
         self.inputs = inputs
 
-    def run(self) -> Dict[str, Any]:
-        # ── Step 1: Detect untested functions ────────────────────────────
+    def run(self) -> dict[str, Any]:
+        logger.info("━━━ NullShift: starting ━━━")
+
+        # Step 1 — Detect
         detect = DetectUntestedFunctions(self.inputs)
-        detect_output = detect.run()
+        detect_out = detect.run()
+        untested = detect_out.get("untested_functions", [])
 
-        # ── Step 2: Generate unit tests via LLM ──────────────────────────
-        generate_inputs = {**self.inputs, **detect_output}
+        if not untested:
+            logger.info("NullShift: no untested functions detected — nothing to do.")
+            return {
+                "untested_functions": [],
+                "generated_tests": [],
+                "pr_url": "",
+                "written_files": [],
+            }
+
+        logger.info(f"NullShift: {len(untested)} function(s) need tests.")
+
+        # Step 2 — Generate
+        generate_inputs = {**self.inputs, "untested_functions": untested}
         generate = GenerateUnitTests(generate_inputs)
-        generate_output = generate.run()
+        generate_out = generate.run()
+        generated = generate_out.get("generated_tests", [])
 
-        # ── Step 3: Commit tests and open PR ─────────────────────────────
-        pr_inputs = {**self.inputs, **generate_output}
-        create_pr = CreateTestPR(pr_inputs)
-        pr_output = create_pr.run()
+        # Step 3 — PR
+        pr_inputs = {**self.inputs, "generated_tests": generated}
+        pr_step = CreateTestPR(pr_inputs)
+        pr_out = pr_step.run()
 
+        logger.info("━━━ NullShift: complete ━━━")
         return {
-            **detect_output,
-            **generate_output,
-            **pr_output,
+            "untested_functions": untested,
+            "generated_tests": generated,
+            "pr_url": pr_out.get("pr_url", ""),
+            "written_files": pr_out.get("written_files", []),
         }

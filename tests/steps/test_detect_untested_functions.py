@@ -1,5 +1,5 @@
 """
-Tests for patchwork.steps.DetectUntestedFunctions
+Tests for DetectUntestedFunctions step.
 """
 from __future__ import annotations
 
@@ -10,180 +10,146 @@ import pytest
 
 from patchwork.steps.DetectUntestedFunctions.DetectUntestedFunctions import (
     DetectUntestedFunctions,
-    _collect_function_names_from_diff,
-    _collect_tested_names,
-    _extract_changed_files,
-    _parse_functions_from_file,
+    _extract_functions,
+    _find_tested_names,
+    _parse_added_files,
 )
 
 
 # ---------------------------------------------------------------------------
-# Unit tests for helper functions
+# Unit tests for helpers
 # ---------------------------------------------------------------------------
 
 
-class TestExtractChangedFiles:
-    def test_extracts_py_file(self, simple_diff):
-        files = _extract_changed_files(simple_diff)
-        assert "patchwork/utils.py" in files
+class TestParseAddedFiles:
+    def test_extracts_python_file(self, simple_diff):
+        result = _parse_added_files(simple_diff)
+        assert "patchwork/utils.py" in result
 
-    def test_ignores_non_python(self):
-        diff = "+++ b/README.md\n"
-        assert _extract_changed_files(diff) == []
+    def test_ignores_non_python_files(self):
+        diff = textwrap.dedent(
+            """\
+            diff --git a/README.md b/README.md
+            index 0000000..1111111 100644
+            --- a/README.md
+            +++ b/README.md
+            @@ -0,0 +1,2 @@
+            +# Hello
+            +World
+            """
+        )
+        assert _parse_added_files(diff) == {}
 
-    def test_empty_diff(self):
-        assert _extract_changed_files("") == []
+    def test_empty_diff_returns_empty(self):
+        assert _parse_added_files("") == {}
 
     def test_multiple_files(self, multi_function_diff):
-        files = _extract_changed_files(multi_function_diff)
-        assert len(files) >= 1
+        result = _parse_added_files(multi_function_diff)
+        assert "patchwork/math_utils.py" in result
 
 
-class TestCollectFunctionNamesFromDiff:
-    def test_finds_added_function(self, simple_diff):
-        names = _collect_function_names_from_diff(simple_diff)
+class TestExtractFunctions:
+    def test_simple_function(self):
+        source = "def add(a, b):\n    return a + b\n"
+        fns = _extract_functions(source, "utils.py")
+        assert len(fns) == 1
+        assert fns[0]["name"] == "add"
+        assert fns[0]["file"] == "utils.py"
+
+    def test_multiple_functions(self):
+        source = textwrap.dedent(
+            """\
+            def foo():
+                pass
+
+            def bar():
+                pass
+            """
+        )
+        fns = _extract_functions(source, "f.py")
+        names = {f["name"] for f in fns}
+        assert "foo" in names
+        assert "bar" in names
+
+    def test_invalid_syntax_returns_empty(self):
+        fns = _extract_functions("def broken(:", "bad.py")
+        assert fns == []
+
+    def test_lineno_populated(self):
+        source = "def add(a, b):\n    return a + b\n"
+        fns = _extract_functions(source, "utils.py")
+        assert fns[0]["lineno"] == 1
+
+
+class TestFindTestedNames:
+    def test_finds_tested_symbol(self, repo_with_tests: Path):
+        names = _find_tested_names(repo_with_tests, ["tests"])
         assert "add" in names
 
-    def test_finds_multiple_functions(self, multi_function_diff):
-        names = _collect_function_names_from_diff(multi_function_diff)
-        assert "multiply" in names
-        assert "divide" in names
+    def test_no_tests_empty_set(self, tmp_path: Path):
+        names = _find_tested_names(tmp_path, ["tests"])
+        assert names == set()
 
-    def test_empty_diff_returns_empty_set(self):
-        assert _collect_function_names_from_diff("") == set()
-
-    def test_ignores_removed_lines(self):
-        diff = "-def old_function():\n-    pass\n"
-        names = _collect_function_names_from_diff(diff)
-        assert "old_function" not in names
-
-    def test_ignores_context_lines(self):
-        diff = " def context_function():\n     pass\n"
-        names = _collect_function_names_from_diff(diff)
-        assert "context_function" not in names
-
-
-class TestParseFunctionsFromFile:
-    def test_parses_simple_function(self, tmp_path):
-        f = tmp_path / "utils.py"
-        f.write_text("def add(a, b):\n    return a + b\n")
-        funcs = _parse_functions_from_file(f)
-        assert len(funcs) == 1
-        assert funcs[0]["name"] == "add"
-        assert funcs[0]["lineno"] == 1
-
-    def test_parses_method_with_class_name(self, tmp_path):
-        f = tmp_path / "cls.py"
-        f.write_text(
-            textwrap.dedent(
-                """\
-                class MyClass:
-                    def my_method(self):
-                        pass
-                """
-            )
-        )
-        funcs = _parse_functions_from_file(f)
-        names = [fn["name"] for fn in funcs]
-        assert "my_method" in names
-
-    def test_returns_empty_on_syntax_error(self, tmp_path):
-        f = tmp_path / "broken.py"
-        f.write_text("def broken(\n")
-        assert _parse_functions_from_file(f) == []
-
-    def test_includes_source_snippet(self, tmp_path):
-        f = tmp_path / "utils.py"
-        f.write_text("def add(a, b):\n    return a + b\n")
-        funcs = _parse_functions_from_file(f)
-        assert "return a + b" in funcs[0]["source"]
-
-
-class TestCollectTestedNames:
-    def test_finds_referenced_name(self, repo_with_tests):
-        tested = _collect_tested_names(repo_with_tests, ["tests"])
-        assert "add" in tested
-
-    def test_returns_empty_when_no_test_dir(self, tmp_path):
-        tested = _collect_tested_names(tmp_path, ["tests"])
-        assert tested == set()
-
-    def test_collects_method_attributes(self, tmp_path):
-        tests = tmp_path / "tests"
-        tests.mkdir()
-        (tests / "test_x.py").write_text("obj.my_method()\n")
-        tested = _collect_tested_names(tmp_path, ["tests"])
-        assert "my_method" in tested
+    def test_missing_test_dir_returns_empty(self, tmp_path: Path):
+        names = _find_tested_names(tmp_path, ["nonexistent"])
+        assert names == set()
 
 
 # ---------------------------------------------------------------------------
-# Integration tests for DetectUntestedFunctions step
+# Integration-style tests for the step itself
 # ---------------------------------------------------------------------------
 
 
-class TestDetectUntestedFunctionsStep:
-    def test_detects_untested_function(self, repo_with_source, simple_diff):
+class TestDetectUntestedFunctions:
+    def test_detects_untested_function(self, simple_diff, repo_with_source):
         step = DetectUntestedFunctions(
-            {
-                "repo_path": str(repo_with_source),
-                "pr_diff": simple_diff,
-            }
+            {"pr_diff": simple_diff, "repo_path": str(repo_with_source)}
         )
-        output = step.run()
-        names = [f["name"] for f in output["untested_functions"]]
+        out = step.run()
+        names = [f["name"] for f in out["untested_functions"]]
         assert "add" in names
 
-    def test_skips_already_tested_function(self, repo_with_tests, simple_diff):
+    def test_skips_already_tested(self, simple_diff, repo_with_tests):
         step = DetectUntestedFunctions(
-            {
-                "repo_path": str(repo_with_tests),
-                "pr_diff": simple_diff,
-            }
+            {"pr_diff": simple_diff, "repo_path": str(repo_with_tests)}
         )
-        output = step.run()
-        names = [f["name"] for f in output["untested_functions"]]
+        out = step.run()
+        # 'add' is already tested in repo_with_tests
+        names = [f["name"] for f in out["untested_functions"]]
         assert "add" not in names
 
-    def test_empty_diff_returns_empty_list(self, repo_with_source):
+    def test_empty_diff_returns_empty(self, repo_with_source):
         step = DetectUntestedFunctions(
-            {
-                "repo_path": str(repo_with_source),
-                "pr_diff": "",
-            }
+            {"pr_diff": "", "repo_path": str(repo_with_source)}
         )
-        output = step.run()
-        assert output["untested_functions"] == []
+        out = step.run()
+        assert out["untested_functions"] == []
 
-    def test_output_contains_required_keys(self, repo_with_source, simple_diff):
-        step = DetectUntestedFunctions(
-            {
-                "repo_path": str(repo_with_source),
-                "pr_diff": simple_diff,
-            }
-        )
-        output = step.run()
-        for func in output["untested_functions"]:
-            assert "name" in func
-            assert "file" in func
-            assert "lineno" in func
-            assert "source" in func
-
-    def test_custom_test_directory(self, tmp_path, simple_diff):
+    def test_custom_test_directories(self, simple_diff, tmp_path):
+        # Create a repo with test in a custom 'spec' directory
         src = tmp_path / "patchwork"
         src.mkdir()
         (src / "utils.py").write_text("def add(a, b):\n    return a + b\n")
-        custom_tests = tmp_path / "spec"
-        custom_tests.mkdir()
-        (custom_tests / "test_utils.py").write_text("add(1, 2)\n")
+        spec_dir = tmp_path / "spec"
+        spec_dir.mkdir()
+        (spec_dir / "test_utils.py").write_text("from patchwork.utils import add\ndef test_add(): assert add(1,2)==3\n")
 
         step = DetectUntestedFunctions(
-            {
-                "repo_path": str(tmp_path),
-                "pr_diff": simple_diff,
-                "test_directories": ["spec"],
-            }
+            {"pr_diff": simple_diff, "repo_path": str(tmp_path), "test_directories": "spec"}
         )
-        output = step.run()
-        # `add` is referenced in `spec/`, so should not appear as untested
-        names = [f["name"] for f in output["untested_functions"]]
+        out = step.run()
+        names = [f["name"] for f in out["untested_functions"]]
         assert "add" not in names
+
+    def test_missing_required_key_raises(self):
+        with pytest.raises((ValueError, KeyError)):
+            DetectUntestedFunctions({})
+
+    def test_multi_function_diff(self, multi_function_diff, tmp_path):
+        step = DetectUntestedFunctions(
+            {"pr_diff": multi_function_diff, "repo_path": str(tmp_path)}
+        )
+        out = step.run()
+        names = [f["name"] for f in out["untested_functions"]]
+        assert "multiply" in names
+        assert "divide" in names
